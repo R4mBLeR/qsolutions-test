@@ -73,8 +73,8 @@ def move_and_click(page, locator, steps=40):
     box = locator.bounding_box()
     if not box:
         raise Exception("Элемент не найден для клика")
-        
-    tx = box["x"] + box["width"] / 3 # немного реалистичнее
+
+    tx = box["x"] + box["width"] / 3
     ty = box["y"] + box["height"] / 2
     sx, sy = 50, 50
 
@@ -87,10 +87,10 @@ def move_and_click(page, locator, steps=40):
         page.wait_for_timeout(8)
 
     page.evaluate("([x,y]) => window.__pulseAt?.(x,y)", [tx, ty])
-    page.wait_for_timeout(150) 
-    
+    page.wait_for_timeout(150)
+
     page.mouse.click(tx, ty)
-    page.wait_for_timeout(300) 
+    page.wait_for_timeout(300)
 
 
 def CaptureVideo_Magento(url, company_name, language, country, postcode, city, street, house_no):
@@ -98,36 +98,41 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
         os.makedirs(PATH_TO_VIDEO_FOLDER, exist_ok=True)
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
+            browser = p.chromium.launch(
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 locale="en-US",
                 timezone_id="Europe/London",
                 viewport={"width": 1280, "height": 720},
                 record_video_dir=PATH_TO_VIDEO_FOLDER,
-                record_video_size={"width": 1280, "height": 720}
+                record_video_size={"width": 1280, "height": 720},
             )
 
             page = context.new_page()
             install_fake_cursor(page)
+
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(1)
 
             search = page.locator("textarea[name='q']")
-            search.wait_for(state="visible")
+            search.wait_for(state="visible", timeout=15000)
+            page.wait_for_timeout(500)
+
             move_and_click(page, search)
             for ch in company_name:
                 search.press(ch)
-                time.sleep(random.uniform(0.05, 0.2))
+                page.wait_for_timeout(int(random.uniform(50, 200)))
             search.press("Enter")
-
-            time.sleep(3)
 
             first_result_link = page.locator("a[data-testid='result-title-a']").first
             first_result_link.wait_for(state="visible", timeout=15000)
+            page.wait_for_timeout(500) 
+
             move_and_click(page, first_result_link)
-            
-            time.sleep(3)
+
+            page.wait_for_timeout(2000)
 
             video_path = page.video.path()
             context.close()
@@ -135,7 +140,7 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
 
             final_path = os.path.join(PATH_TO_VIDEO_FOLDER, f"{company_name}.webm")
             os.rename(video_path, final_path)
-            
+
             return os.path.abspath(final_path)
 
     except Exception as e:
