@@ -110,7 +110,7 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
 
             page = context.new_page()
             install_fake_cursor(page)
-            page.goto(url, wait_until="networkidle")
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(1)
 
             search = page.locator("textarea[name='q']")
