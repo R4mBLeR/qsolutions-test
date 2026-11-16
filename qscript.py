@@ -139,7 +139,7 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
             browser.close()
 
             final_path = os.path.join(PATH_TO_VIDEO_FOLDER, f"{company_name}.webm")
-            os.rename(video_path, final_path)
+            os.replace(video_path, final_path)
 
             return os.path.abspath(final_path)
 
