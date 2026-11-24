@@ -1,27 +1,36 @@
+import asyncio
 import os
 import re
-import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
+import psycopg2
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
+from psycopg2.extras import RealDictCursor
 import uvicorn
+
 
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
-DB_PATH = BASE_DIR / "videos.db"
-
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-app = FastAPI()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+DB_CONFIG = {
+    "dbname": os.getenv("POSTGRES_DB", "qsolution_db"),
+    "user": os.getenv("POSTGRES_USER", "postgres"),
+    "password": os.getenv("POSTGRES_PASSWORD", ""),
+    "host": os.getenv("POSTGRES_HOST", "postgres"),
+    "port": os.getenv("POSTGRES_PORT", "5432"),
+}
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=3.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=3000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = psycopg2.connect(**DB_CONFIG)
     try:
         yield conn
     finally:
@@ -29,23 +38,37 @@ def get_db():
 
 
 def init_db() -> None:
-    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    conn = psycopg2.connect(**DB_CONFIG)
     try:
-        conn.execute("PRAGMA busy_timeout=3000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS videos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company_name TEXT NOT NULL UNIQUE,
-                file_path TEXT NOT NULL,        -- absolute path to the file on disk
-                video_url TEXT NOT NULL,        -- public URL to the video
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        conn.commit()
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS videos (
+                    id SERIAL PRIMARY KEY,
+                    company_name TEXT NOT NULL UNIQUE,
+                    file_path TEXT NOT NULL,
+                    video_url TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
     finally:
         conn.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    for attempt in range(1, 11):
+        try:
+            init_db()
+            break
+        except psycopg2.OperationalError:
+            if attempt == 10:
+                raise
+            await asyncio.sleep(2)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def safe_filename(company_name: str) -> str:
@@ -53,12 +76,27 @@ def safe_filename(company_name: str) -> str:
     return f"{stem or 'video'}.webm"
 
 
+def upsert_video(db, company_name: str, file_path: str, video_url: str) -> None:
+    with db, db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO videos (company_name, file_path, video_url)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (company_name) DO UPDATE SET
+                file_path = EXCLUDED.file_path,
+                video_url = EXCLUDED.video_url,
+                updated_at = now()
+            """,
+            (company_name, file_path, video_url),
+        )
+
+
 @app.post("/upload")
 async def upload_video(
     request: Request,
     file: Optional[UploadFile] = File(None),
     company_name: Optional[str] = Form(None),
-    db: sqlite3.Connection = Depends(get_db),
+    db: psycopg2.extensions.connection = Depends(get_db),
 ):
     if file is None or not company_name or not company_name.strip():
         raise HTTPException(
@@ -73,30 +111,24 @@ async def upload_video(
         while chunk := await file.read(1024 * 1024):
             out.write(chunk)
 
-    video_url = str(request.base_url).rstrip("/") + f"/media/{file_path.name}"
+    base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    video_url = f"{base_url}/media/{quote(file_path.name)}"
 
-    db.execute(
-        """
-        INSERT INTO videos (company_name, file_path, video_url)
-        VALUES (?, ?, ?)
-        ON CONFLICT(company_name) DO UPDATE SET
-            file_path = excluded.file_path,
-            video_url = excluded.video_url,
-            updated_at = datetime('now')
-        """,
-        (company_name, str(file_path.resolve()), video_url),
+    await run_in_threadpool(
+        upsert_video, db, company_name, str(file_path.resolve()), video_url
     )
-    db.commit()
 
     return {"company_name": company_name, "video_url": video_url}
 
 
 @app.get("/get_video_url")
-def get_video_url(company_name: str, db: sqlite3.Connection = Depends(get_db)):
-    row = db.execute(
-        "SELECT company_name, video_url FROM videos WHERE company_name = ?",
-        (company_name,),
-    ).fetchone()
+def get_video_url(company_name: str, db: psycopg2.extensions.connection = Depends(get_db)):
+    with db.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT company_name, video_url FROM videos WHERE company_name = %s",
+            (company_name,),
+        )
+        row = cur.fetchone()
     if row is None:
         raise HTTPException(
             status_code=404, detail=f"No video found for company '{company_name}'"
@@ -113,20 +145,19 @@ def media(filename: str):
 
 
 @app.get("/videos")
-def list_videos(db: sqlite3.Connection = Depends(get_db)):
-    rows = db.execute(
-        """
-        SELECT id, company_name, file_path, video_url, created_at, updated_at
-        FROM videos ORDER BY id
-        """
-    ).fetchall()
+def list_videos(db: psycopg2.extensions.connection = Depends(get_db)):
+    with db.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, company_name, file_path, video_url, created_at, updated_at
+            FROM videos ORDER BY id
+            """
+        )
+        rows = cur.fetchall()
     return [dict(row) for row in rows]
-
-
-init_db()
 
 
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", "4002"))
     uvicorn.run(app, host=host, port=port)
